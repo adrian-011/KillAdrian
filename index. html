@@ -105,7 +105,9 @@
 
   // Unlock audio on user gesture
   function unlockAudio(){ if (audioUnlocked) return; try{ audioCtx.resume(); audioUnlocked = true; music.el.play(); }catch(e){} }
-  canvas.addEventListener('pointerup', unlockAudio, {once:true});
+  startBtn.addEventListener('touchend', unlockAudio);
+instrBtn.addEventListener('touchend', unlockAudio);
+restartBtn.addEventListener('touchend', unlockAudio);
 
   // Input
   let keys = {}; addEventListener('keydown', e => keys[e.key.toLowerCase()]=true);
