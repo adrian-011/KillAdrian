@@ -1,0 +1,240 @@
+<!doctype html>
+
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Kill Adrian — Pixel — 6 Days</title>
+  <style>
+    :root{--ui-bg:rgba(0,0,0,0.45);--ui-text:#eaeaea}
+    html,body{height:100%;margin:0;background:#08080a;color:var(--ui-text);font-family:Inter,system-ui,Arial}
+    #wrap{display:flex;align-items:center;justify-content:center;height:100vh}
+    canvas{image-rendering:pixelated;background:#0b0b0f;max-width:100%;height:auto;box-shadow:0 10px 40px rgba(0,0,0,0.7);border-radius:6px}
+    .ui{position:fixed;left:12px;top:12px;background:var(--ui-bg);padding:8px 10px;border-radius:6px;font-size:13px}
+    .side{position:fixed;right:12px;top:12px;background:var(--ui-bg);padding:8px 10px;border-radius:6px;font-size:13px;text-align:right}
+    .controls{position:fixed;left:12px;bottom:12px;background:var(--ui-bg);padding:8px;border-radius:8px;font-size:13px}
+    .overlay{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px;color:#fff}
+    .title{font-size:48px;letter-spacing:2px;font-family:monospace}
+    .btn{background:#222;border:1px solid #444;padding:10px 16px;border-radius:6px;cursor:pointer}
+    .small{font-size:14px;color:#ddd}
+    .hidden{display:none}
+    @media (pointer:coarse){ .ui,.side{font-size:15px} }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="c" width="640" height="360" tabindex="0"></canvas>
+  </div>  <div id="titleScreen" class="overlay" style="background:linear-gradient(180deg, rgba(0,0,0,0.6), rgba(0,0,0,0.85));">
+    <div class="title">Kill Adrian</div>
+    <div class="small">A short pixel psychological horror — symbolic only</div>
+    <div style="display:flex;gap:12px">
+      <button id="startBtn" class="btn">Start Game</button>
+      <button id="instrBtn" class="btn">Instructions</button>
+    </div>
+    <div id="instr" class="small hidden" style="max-width:560px;text-align:center;padding:8px">Move: WASD / Arrow keys or tap to move. Tap near Adrian to interact. Picking up a knife is symbolic; no gore is shown. Days progress and the story unfolds.</div>
+  </div>  <div id="uiTop" class="ui hidden">Day: <span id="dayCount">1</span> / 6 — <span id="clock">06:00 AM</span></div>
+  <div id="sideUI" class="side hidden"></div>
+  <div class="controls">Double-tap to sprint — R to restart</div>  <div id="endScreen" class="overlay hidden" style="background:rgba(0,0,0,0.9);">
+    <div style="text-align:center">
+      <div class="title">Game Over</div>
+      <div class="small">You can’t undo it.</div>
+      <div style="margin-top:14px"><button id="restartBtn" class="btn">Restart</button></div>
+    </div>
+  </div>  <!-- Assets: place walk.wav, interact.wav, vanish.wav, censor_beep.wav, lofi.mp3 next to this html --><script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+
+  // DOM
+  const titleScreen = document.getElementById('titleScreen');
+  const startBtn = document.getElementById('startBtn');
+  const instrBtn = document.getElementById('instrBtn');
+  const instr = document.getElementById('instr');
+  const uiTop = document.getElementById('uiTop');
+  const dayCount = document.getElementById('dayCount');
+  const clockEl = document.getElementById('clock');
+  const sideUI = document.getElementById('sideUI');
+  const endScreen = document.getElementById('endScreen');
+  const restartBtn = document.getElementById('restartBtn');
+
+  // Game states
+  let state = 'title'; // title | playing | ended
+
+  // Room
+  const room = {x:24,y:24,w:W-48,h:H-48};
+
+  // Player
+  const player = {x:room.x+36,y:room.y+room.h-64,w:8,h:12,speed:1.6,vx:0,vy:0,moving:false,tremble:0,hasKnife:false};
+
+  // Adrian
+  let adrian = {x:room.x+room.w-96,y:room.y+36,w:8,h:12,exists:true,ashStage:0};
+
+  // Days
+  const TOTAL_DAYS = 6;
+  let currentDay = 1; dayCount.textContent = currentDay;
+  const DAY_SECONDS = 120; // 2 minutes per day
+  let dayTimer = 0;
+  let afterVanishFast = false;
+
+  // Audio (web audio for filters)
+  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  let audioUnlocked = false;
+
+  // helper to create audio elements and connect to audioCtx for simple filtering
+  function makeSound(src, loop=false, vol=0.6){
+    const el = new Audio(src); el.loop = loop; el.volume = vol; el.preload = 'auto';
+    const track = audioCtx.createMediaElementSource(el);
+    const gain = audioCtx.createGain(); gain.gain.value = vol;
+    track.connect(gain).connect(audioCtx.destination);
+    return {el,track,gain};
+  }
+
+  // expected files
+  const sfx_walk = makeSound('walk.wav', true, 0.35);
+  const sfx_interact = makeSound('interact.wav', false, 0.7);
+  const sfx_vanish = makeSound('vanish.wav', false, 0.9);
+  const sfx_censor = makeSound('censor_beep.wav', false, 0.9);
+  const music = makeSound('lofi.mp3', true, 0.45);
+
+  // We'll use a simple biquad filter to progressively distort music (lowering bandwidth / adding muffled effect)
+  const musicSource = audioCtx.createMediaElementSource(music.el);
+  const filter = audioCtx.createBiquadFilter(); filter.type = 'lowpass'; filter.frequency.value = 22000; // start open
+  const musicGain = audioCtx.createGain(); musicGain.gain.value = 0.45;
+  musicSource.connect(filter).connect(musicGain).connect(audioCtx.destination);
+
+  // Unlock audio on user gesture
+  function unlockAudio(){ if (audioUnlocked) return; try{ audioCtx.resume(); audioUnlocked = true; music.el.play(); }catch(e){} }
+  canvas.addEventListener('pointerup', unlockAudio, {once:true});
+
+  // Input
+  let keys = {}; addEventListener('keydown', e => keys[e.key.toLowerCase()]=true);
+  addEventListener('keyup', e => keys[e.key.toLowerCase()]=false);
+
+  // pointer movement / tap
+  let lastTap = 0; let touchDest = null;
+  canvas.addEventListener('pointerdown', e => {
+    if (!audioUnlocked) unlockAudio();
+    const rect = canvas.getBoundingClientRect();
+    const mx = (e.clientX - rect.left) * (canvas.width / rect.width);
+    const my = (e.clientY - rect.top) * (canvas.height / rect.height);
+    // double-tap to sprint
+    const now = Date.now(); if (now - lastTap < 300){ player.speed = 3.4; setTimeout(()=>player.speed=1.6,800); }
+    lastTap = now;
+    // if in title, start
+    if (state === 'title') { startGame(); return; }
+    if (state !== 'playing') return;
+    // interact if near Adrian
+    if (adrian.exists){ const dx = (adrian.x+adrian.w/2)-mx; const dy = (adrian.y+adrian.h/2)-my; if (Math.hypot(dx,dy) < 36){ attemptVanish(); return; } }
+    touchDest = {x: mx - player.w/2, y: my - player.h/2};
+  });
+
+  function attemptVanish(){
+    if (!adrian.exists) return;
+    // require player to have knife (pick up knife by walking over it)
+    if (!player.hasKnife) { try{ sfx_interact.el.currentTime=0; sfx_interact.el.play(); }catch(e){}; return; }
+    // vanish effect: sound + small flash, then mark vanished
+    try{ sfx_vanish.el.currentTime=0; sfx_vanish.el.play(); }catch(e){}
+    setTimeout(()=>{ try{ sfx_censor.el.currentTime=0; sfx_censor.el.play(); }catch(e){} }, 220);
+    adrian.exists = false; adrian.ashStage = 0; // start ash next day
+    // brief silence then resume music
+    try{ music.el.pause(); setTimeout(()=>music.el.play(), 800); }catch(e){}
+    afterVanishFast = true; dayTimer = 0; currentDay = 1; dayCount.textContent = currentDay; uiTop.style.display = 'block';
+  }
+
+  // Knife item
+  const knife = {x: room.x+room.w/2 - 8, y: room.y + room.h - 48, w:6, h:6, picked:false};
+
+  // Restart
+  function fullRestart(){ state = 'title'; titleScreen.classList.remove('hidden'); endScreen.classList.add('hidden'); uiTop.classList.add('hidden'); music.el.currentTime = 0; try{ music.el.play(); }catch(e){}; // reset
+    // reset world
+    player.x = room.x+36; player.y = room.y+room.h-64; player.hasKnife = false; player.tremble = 0;
+    adrian = {x:room.x+room.w-96,y:room.y+36,w:8,h:12,exists:true,ashStage:0};
+    currentDay = 1; dayCount.textContent = currentDay; dayTimer = 0; afterVanishFast = false; knife.picked = false; titleScreen.classList.remove('hidden');
+  }
+
+  restartBtn.addEventListener('click', ()=>{ fullRestart(); });
+
+  // start game
+  function startGame(){ state = 'playing'; titleScreen.classList.add('hidden'); uiTop.classList.remove('hidden'); sideUI.classList.remove('hidden'); try{ music.el.play(); }catch(e){} }
+  startBtn.addEventListener('click', ()=>{ unlockAudio(); startGame(); });
+  instrBtn.addEventListener('click', ()=>{ instr.classList.toggle('hidden'); });
+
+  // Clock format
+  function formatClock(secondsIntoDay){ const minutesPerDay = 24*60; const totalMinutes = Math.floor((secondsIntoDay / DAY_SECONDS) * minutesPerDay); let hh = Math.floor(totalMinutes/60); let mm = totalMinutes % 60; const am = hh < 12; let displayH = hh % 12; if (displayH===0) displayH = 12; return `${String(displayH).padStart(2,'0')}:${String(mm).padStart(2,'0')} ${am ? 'AM' : 'PM'}`; }
+
+  // Main update
+  let last = performance.now(); let frame = 0;
+  function update(dt){ frame++;
+    if (state !== 'playing') return;
+    // input
+    const up = keys['w']||keys['arrowup']; const down = keys['s']||keys['arrowdown']; const left = keys['a']||keys['arrowleft']; const right = keys['d']||keys['arrowright']; player.vx=0; player.vy=0; if (up) player.vy=-1; if (down) player.vy=1; if (left) player.vx=-1; if (right) player.vx=1; if (player.vx!==0 && player.vy!==0){ player.vx *= Math.SQRT1_2; player.vy *= Math.SQRT1_2; }
+    // touch dest
+    if (touchDest){ const dx = touchDest.x - player.x; const dy = touchDest.y - player.y; const d = Math.hypot(dx,dy); if (d>4){ player.vx = dx/d; player.vy = dy/d; } else { touchDest = null; } }
+    player.moving = Math.abs(player.vx) > 0.01 || Math.abs(player.vy) > 0.01;
+    player.x += player.vx * player.speed; player.y += player.vy * player.speed;
+    player.x = Math.max(room.x+4, Math.min(room.x+room.w - player.w -4, player.x)); player.y = Math.max(room.y+4, Math.min(room.y+room.h - player.h -4, player.y));
+    // pick up knife
+    if (!knife.picked && Math.hypot((player.x+player.w/2)-(knife.x+knife.w/2),(player.y+player.h/2)-(knife.y+knife.h/2)) < 12){ knife.picked = true; player.hasKnife = true; try{ sfx_interact.el.currentTime=0; sfx_interact.el.play(); }catch(e){} }
+    // walking sound
+    if (audioUnlocked){ if (player.moving && sfx_walk.el.paused){ try{sfx_walk.el.play();}catch(e){} } if (!player.moving && !sfx_walk.el.paused && !touchDest){ try{sfx_walk.el.pause(); sfx_walk.el.currentTime=0;}catch(e){} } }
+
+    // day progression
+    if (!afterVanishFast){ dayTimer += dt; if (dayTimer >= DAY_SECONDS){ dayTimer = 0; currentDay = Math.min(TOTAL_DAYS, currentDay+1); dayCount.textContent = currentDay; } }
+    else { // fast-forward after vanish (faster progression)
+      dayTimer += dt * (DAY_SECONDS / 10); // fast: 10s per day
+      if (dayTimer >= DAY_SECONDS){ dayTimer = 0; currentDay = Math.min(TOTAL_DAYS, currentDay+1); dayCount.textContent = currentDay; // progress ash
+        if (!adrian.exists){ adrian.ashStage = Math.min(6, adrian.ashStage+1); }
+        if (currentDay >= TOTAL_DAYS){ afterVanishFast = false; // stop fast-forward and show end screen soon
+          setTimeout(()=>{ state='ended'; endScreen.classList.remove('hidden'); uiTop.classList.add('hidden'); sideUI.classList.add('hidden'); // fade music
+            const fade = setInterval(()=>{ music.gain.gain.value = Math.max(0, music.gain.gain.value - 0.02); if (music.gain.gain.value<=0.02){ clearInterval(fade); music.el.pause(); music.gain.gain.value = 0.45; } }, 120); }, 1200);
+        }
+      }
+    }
+
+    // update UI
+    clockEl.textContent = formatClock(dayTimer);
+    sideUI.innerHTML = `Day ${currentDay} / ${TOTAL_DAYS} — ${formatClock(dayTimer)}`;
+
+    // tremble effect increases as ashStage grows
+    if (!adrian.exists){ player.tremble = Math.min(6, player.tremble + 0.005*dt*60 + adrian.ashStage*0.02); }
+
+    // progressively muffle music as days advance (map 1..6 to filter frequency)
+    const freq = 22000 - (currentDay-1) * 3200 - adrian.ashStage*1200; filter.frequency.setTargetAtTime(Math.max(800, freq), audioCtx.currentTime, 0.5);
+  }
+
+  // drawing helpers
+  function pfill(x,y,w,h,color){ ctx.fillStyle = color; ctx.fillRect(Math.round(x),Math.round(y),Math.round(w),Math.round(h)); }
+
+  function drawRoom(){ pfill(room.x,room.y,room.w,room.h,'#d7cdbf'); pfill(room.x+28,room.y+room.h-80,120,48,'#b48fb0'); pfill(room.x + room.w - 140, room.y + room.h - 64, 96, 48, '#6a7fa2'); pfill(room.x + room.w - 140 + 6, room.y + room.h - 64 + 6, 84, 18, '#48607f'); // window lighting
+    const clockPercent = dayTimer / DAY_SECONDS; const hh = Math.floor((clockPercent*24)); const isDay = hh >=6 && hh < 18;
+    pfill(room.x + 20, room.y + 12, 80, 48, isDay ? '#88c1ff' : '#1b2a44'); ctx.save(); ctx.globalAlpha = isDay ? 0.12 : 0.06; pfill(room.x + 20, room.y + 68, 120, 80, isDay ? '#fff8d6' : '#0b1220'); ctx.restore(); pfill(room.x + 140, room.y + 12, 64, 40, '#2f2f2f'); }
+
+  function drawPlayer(){ const shake = player.tremble * (Math.sin(frame*0.5) * 0.5 + 0.5); const px = player.x + (Math.random()*shake - shake/2); const py = player.y + (Math.random()*shake - shake/2); pfill(px,py,player.w,player.h,'#223344'); pfill(px+1,py-6,player.w-2,6,'#f1c27d'); pfill(px+2,py-4,2,2,'#111'); pfill(px+5,py-4,2,2,'#111'); if (player.hasKnife){ // draw small knife in hand
+      pfill(px+6,py+2,6,2,'#333'); pfill(px+11,py+1,2,4,'#dcdcdc'); } }
+
+  function drawAdrian(){ if (adrian.exists){ pfill(adrian.x,adrian.y,adrian.w,adrian.h,'#b23a3a'); pfill(adrian.x+1,adrian.y-6,adrian.w-2,6,'#f1c27d'); if (frame % 240 < 8){ pfill(adrian.x+2,adrian.y-4,2,2,'#111'); pfill(adrian.x+5,adrian.y-4,2,2,'#111'); } ctx.font='9px monospace'; ctx.fillStyle='#222'; ctx.fillText('Adrian', adrian.x-4, adrian.y-8); }
+    else { // ash stages 0..6 => show ash pile
+      const colors = ['#7b2e2e','#6b2929','#5b2424','#463030','#302a28','#211f1d','#0f0f0f']; const c = colors[Math.min(adrian.ashStage, colors.length-1)]; pfill(adrian.x,adrian.y + (adrian.ashStage*1.2), adrian.w, Math.max(2, adrian.h - adrian.ashStage*1.6), c);
+      if (adrian.ashStage >= 6){ for (let i=0;i<6;i++){ pfill(adrian.x + Math.random()*adrian.w, adrian.y + Math.random()*adrian.h, 1,1, '#7a7a7a'); } }
+    } }
+
+  function drawKnife(){ if (!knife.picked){ pfill(knife.x,knife.y,knife.w,knife.h,'#bdbdbd'); pfill(knife.x+1,knife.y-2,knife.w-2,2,'#888'); } }
+
+  function drawHUD(){ if (adrian.exists){ const d = Math.round(Math.hypot((adrian.x+adrian.w/2)-(player.x+player.w/2),(adrian.y+adrian.h/2)-(player.y+player.h/2))); ctx.fillStyle='#000'; ctx.fillRect(6,H-26,160,20); ctx.fillStyle='#fff'; ctx.font='10px monospace'; ctx.fillText('Distance: '+d+' px',10,H-12); } }
+
+  function render(){ ctx.clearRect(0,0,W,H); ctx.fillStyle='#08080a'; ctx.fillRect(0,0,W,H); drawRoom(); drawAdrian(); drawKnife(); drawPlayer(); drawHUD(); }
+
+  function loop(t){ const now = t; const dt = Math.min(0.1,(now - last)/1000); last = now; update(dt); render(); requestAnimationFrame(loop); }
+  requestAnimationFrame(loop);
+
+  // keyboard focus
+  canvas.addEventListener('click', ()=>canvas.focus());
+  addEventListener('keydown', e => { if (e.key.toLowerCase()==='r'){ fullRestart(); } });
+
+  // initial music play on title
+  try{ music.el.play(); }catch(e){}
+
+})();
+</script></body>
+</html>
